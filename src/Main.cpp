@@ -1,123 +1,146 @@
 #include <Arduino.h>
-#include <micro_ros_platformio.h>
-#include <rcl/rcl.h>
-#include <rclc/rclc.h>
-#include <rclc/executor.h>
-#include <sensor_msgs/msg/joint_state.h>
-#include <std_msgs/msg/float64_multi_array.h>
-#include <std_msgs/msg/int32.h>
 
-// Global variables
-rcl_publisher_t joint_state_pub;
-rcl_publisher_t trial_status_pub;
-rcl_subscription_t torque_sub;
-sensor_msgs__msg__JointState joint_state_msg;
-std_msgs__msg__Float64MultiArray torque_msg;
-std_msgs__msg__Int32 trial_status_msg;
-rclc_executor_t executor;
-rclc_support_t support;
-rcl_allocator_t allocator;
-rcl_node_t node;
-rcl_timer_t timer;
+// Motor 1 pins (L298N)
+#define PWM_M1 2   // PWM2, enable pin for Motor 1
+#define DIR_F1 20  // F2, forward pin (Motor 1)
+#define DIR_B1 21  // B2, backward pin (Motor 1)
 
-#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){error_loop();}}
-#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){}}
+// Motor 2 pins (defined, unused)
+#define PWM_M2 3   // PWM3, enable pin for Motor 2
+#define DIR_F2 22  // F1, forward pin (Motor 2)
+#define DIR_B2 23  // B1, backward pin (Motor 2)
 
-void error_loop() {
-  while (1) {
-    delay(100);
-  }
-}
+// Current sense pins
+#define SENSE_M1 A13  // Current sense for Motor 1
+#define SENSE_M2 A12  // Current sense for Motor 2
 
-void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
-  RCLC_UNUSED(last_call_time);
-  if (timer != NULL) {
-    // Fixed joint states (can be made dynamic)
-    joint_state_msg.position.data[0] = 0.0;  // q1
-    joint_state_msg.position.data[1] = 0.0;  // q2
-    joint_state_msg.velocity.data[0] = 0.0;  // dq1
-    joint_state_msg.velocity.data[1] = 0.0;  // dq2
-    RCSOFTCHECK(rcl_publish(&joint_state_pub, &joint_state_msg, NULL));
-  }
-}
+// Encoder pins
+#define ENC1_POS A14  // E1+, Motor 1 encoder positive
+#define ENC1_NEG A15  // E1-, Motor 1 encoder negative
+#define ENC2_POS A16  // E2+, Motor 2 encoder positive
+#define ENC2_NEG A17  // E2-, Motor 2 encoder negative
 
-void subscription_callback(const void *msgin) {
-  const std_msgs__msg__Float64MultiArray *msg = (const std_msgs__msg__Float64MultiArray *)msgin;
-  if (msg->data.size == 2) {
-    Serial.print("Received torques: ");
-    Serial.print(msg->data.data[0]);
-    Serial.print(", ");
-    Serial.println(msg->data.data[1]);
-  }
+// Motor control variables
+bool motor1_forward = true;  // Motor 1 direction
+const int pwm_value = 255;   // 100% duty cycle (0-255)
+volatile unsigned long enc1_count = 0;  // Rising edges on E1+
+unsigned long last_time = 0;
+const unsigned long interval = 5000;  // 5 seconds
+
+// Interrupt handler for E1+ rising edges
+void encoder1_isr() {
+  enc1_count++;
 }
 
 void setup() {
+  // Initialize USB serial
   Serial.begin(115200);
-  set_microros_serial_transports(Serial);
   delay(2000);
+  Serial.println("Setup started");
 
-  allocator = rcl_get_default_allocator();
-  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
-  RCCHECK(rclc_node_init_default(&node, "micro_ros_node", "", &support));
+  // Motor 1 pins
+  pinMode(PWM_M1, OUTPUT);
+  pinMode(DIR_F1, OUTPUT);
+  pinMode(DIR_B1, OUTPUT);
 
-  // Publishers
-  RCCHECK(rclc_publisher_init_default(
-    &joint_state_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, JointState),
-    "/joint_states"));
-  RCCHECK(rclc_publisher_init_default(
-    &trial_status_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-    "/trial_status"));
+  // Motor 2 pins (unused, set as output for safety)
+  pinMode(PWM_M2, OUTPUT);
+  pinMode(DIR_F2, OUTPUT);
+  pinMode(DIR_B2, OUTPUT);
 
-  // Subscriber
-  RCCHECK(rclc_subscription_init_default(
-    &torque_sub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64MultiArray),
-    "/torque_commands"));
+  // Set Motor 2 off
+  analogWrite(PWM_M2, 0);
+  digitalWrite(DIR_F2, LOW);
+  digitalWrite(DIR_B2, LOW);
 
-  // Initialize JointState message
-    sensor_msgs__msg__JointState__init(&joint_state_msg);
-    joint_state_msg.name.size = 2;
-    joint_state_msg.name.capacity = 2;
-    joint_state_msg.name.data = (rosidl_runtime_c__String*)malloc(2 * sizeof(rosidl_runtime_c__String));
-    const char* joint_names[] = {"joint1", "joint2"};
-    for (size_t i = 0; i < 2; i++) {
-        size_t len = strlen(joint_names[i]);
-        joint_state_msg.name.data[i].data = (char*)malloc(len + 1);
-        strcpy(joint_state_msg.name.data[i].data, joint_names[i]);
-        joint_state_msg.name.data[i].size = len;
-        joint_state_msg.name.data[i].capacity = len + 1;
-    }
+  // Encoder pins as input
+  pinMode(ENC1_POS, INPUT);
+  pinMode(ENC1_NEG, INPUT);
+  pinMode(ENC2_POS, INPUT);
+  pinMode(ENC2_NEG, INPUT);
 
-  // Initialize trial status
-  trial_status_msg.data = 1;  // Execute trial
+  // Attach interrupt for E1+ rising edge
+  attachInterrupt(digitalPinToInterrupt(ENC1_POS), encoder1_isr, RISING);
 
-  // Timer for joint states (100 Hz)
-  const unsigned int timer_timeout = 10;  // 10 ms
-  RCCHECK(rclc_timer_init_default(&timer, &support, RCL_MS_TO_NS(timer_timeout), timer_callback));
+  // Initialize ADC resolution (10-bit default, 0-1023)
+  analogReadResolution(10);
 
-  // Executor
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
-  RCCHECK(rclc_executor_add_timer(&executor, &timer));
-  
-  // Add subscription with executor
-  std_msgs__msg__Float64MultiArray torque_msg;
-  std_msgs__msg__Float64MultiArray__init(&torque_msg); // Optional but recommended
-  RCCHECK(rclc_executor_add_subscription(&executor, &torque_sub, &torque_msg, &subscription_callback, ON_NEW_DATA));
+  // Set PWM frequency to 100 Hz
+  Serial.println("PWM frequency set to 100 Hz on pin 4");
 
-  // Publish initial joint states
-  RCSOFTCHECK(rcl_publish(&trial_status_pub, &trial_status_msg, NULL));
-
-  // Publish initial trial status
-  RCSOFTCHECK(rcl_publish(&joint_state_pub, &joint_status_msg, NULL));
+  // Debug pin states
+  Serial.println("Motor 1 pins: PWM=" + String(PWM_M1) + ", F2=" + String(DIR_F1) + ", B2=" + String(DIR_B1));
+  Serial.println("Sense pins: M1=A13, M2=A12");
+  Serial.println("Encoder pins: E1+=" + String(ENC1_POS) + ", E1-=" + String(ENC1_NEG));
+  Serial.println("Setup complete");
 }
 
 void loop() {
-  delay(100);
+  unsigned long current_time = millis();
 
-  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(100)));
+  // Every 5 seconds, toggle direction and read measurements
+  if (current_time - last_time >= interval) {
+    // Stop motor briefly before changing direction
+    analogWrite(PWM_M1, 0);
+    digitalWrite(DIR_F1, LOW);
+    digitalWrite(DIR_B1, LOW);
+    delay(100);  // Brief pause to prevent H-bridge stress
+    Serial.println("Motor 1: Stopped briefly");
+
+    // Toggle Motor 1 direction
+    motor1_forward = !motor1_forward;
+
+    if (motor1_forward) {
+      digitalWrite(DIR_F1, HIGH);
+      digitalWrite(DIR_B1, LOW);
+      analogWrite(PWM_M1, pwm_value);  // 100% speed
+      Serial.println("Motor 1: Forward, PWM=" + String(pwm_value));
+    } else {
+      digitalWrite(DIR_F1, LOW);
+      digitalWrite(DIR_B1, HIGH);
+      analogWrite(PWM_M1, pwm_value);  // 100% speed
+      Serial.println("Motor 1: Backward, PWM=" + String(pwm_value));
+    }
+
+    // Read current sense (A13, A12)
+    int sense_m1 = analogRead(SENSE_M1);
+    int sense_m2 = analogRead(SENSE_M2);
+    float current_m1 = (sense_m1 * 3.3 / 1023.0) / 10.0;  // V_sense / R_sense
+    float current_m2 = (sense_m2 * 3.3 / 1023.0) / 10.0;
+
+    // Read encoder states (A14-A17)
+    int enc1_pos = analogRead(ENC1_POS);  // E1+
+    int enc1_neg = analogRead(ENC1_NEG);  // E1-
+    int enc2_pos = analogRead(ENC2_POS);  // E2+
+    int enc2_neg = analogRead(ENC2_NEG);  // E2-
+
+    // Calculate speed (edges per 5 seconds)
+    float speed_rpm = (enc1_count / 2.0) * (60.0 / 5.0);  // Assume 2 pulses per revolution
+    enc1_count = 0;  // Reset count
+
+    // Determine direction from encoder phase
+    String direction = (enc1_pos > 512 && enc1_neg < 512) ? "Forward" : 
+                      (enc1_neg > 512 && enc1_pos < 512) ? "Backward" : "Unknown";
+
+    // Output measurements
+    Serial.print("Current M1: ");
+    Serial.print(current_m1, 3);
+    Serial.print(" A, Current M2: ");
+    Serial.print(current_m2, 3);
+    Serial.println(" A");
+    Serial.print("Encoder M1: E1+=");
+    Serial.print(enc1_pos);
+    Serial.print(", E1-=");
+    Serial.print(enc1_neg);
+    Serial.print(", Speed: ");
+    Serial.print(speed_rpm, 1);
+    Serial.print(" RPM, Direction: ");
+    Serial.println(direction);
+    Serial.print("Encoder M2: E2+=");
+    Serial.print(enc2_pos);
+    Serial.print(", E2-=");
+    Serial.println(enc2_neg);
+
+    last_time = current_time;
+  }
 }

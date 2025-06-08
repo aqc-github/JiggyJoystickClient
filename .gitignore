@@ -1,2 +1,3 @@
 // Ignore the .pio directory and its contents
 ./.pio/
+.pio/

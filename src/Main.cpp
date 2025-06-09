@@ -1,4 +1,8 @@
 #include <Arduino.h>
+#include <math.h> // For sin() and M_PI
+
+#define GEARING     50
+#define ENCODERMULT 12
 
 // Motor 1 pins (L298N)
 #define PWM_M1 2   // PWM2, enable pin for Motor 1
@@ -21,22 +25,38 @@
 #define ENC2_NEG A17  // E2-, Motor 2 encoder negative
 
 // Motor control variables
-bool motor1_forward = true;  // Motor 1 direction
-const int pwm_value = 255;   // 100% duty cycle (0-255)
+int pwm_value = 255;   // Initial PWM value (will be updated sinusoidally)
 volatile unsigned long enc1_count = 0;  // Rising edges on E1+
-unsigned long last_time = 0;
-const unsigned long interval = 5000;  // 5 seconds
+unsigned long last_time = 0;           // For 100 ms messaging
+volatile uint32_t lastA = 0;           // Last pulse time for RPM
+volatile float RPM = 0.0;              // Calculated RPM
+const float PWM_PERIOD = 6000.0;      // Period for sinusoidal PWM (ms)
 
-// Interrupt handler for E1+ rising edges
+// Interrupt handler for E1+ rising edges (counts pulses and calculates RPM)
 void encoder1_isr() {
   enc1_count++;
+  digitalWrite(LED_BUILTIN, HIGH);
+  uint32_t currA = micros();
+  if (lastA < currA) {
+    // Did not wrap around
+    float rev = currA - lastA;  // us
+    rev = 1.0 / rev;            // rev per us
+    rev *= 1000000;             // rev per sec
+    rev *= 60;                  // rev per min
+    rev /= GEARING;             // Account for gear ratio (20)
+    rev /= ENCODERMULT;         // Account for multiple ticks per rotation (12)
+    RPM = rev;
+  }
+  lastA = currA;
+  digitalWrite(LED_BUILTIN, LOW);
 }
 
 void setup() {
   // Initialize USB serial
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("Setup started");
+  // Ensure labels are the first serial output
+  Serial.println("I_M1(mA),Speed(RPM/100):");
+  while (!Serial && millis() < 2000); // Wait up to 2 seconds for Serial Monitor
 
   // Motor 1 pins
   pinMode(PWM_M1, OUTPUT);
@@ -56,90 +76,49 @@ void setup() {
   // Encoder pins as input
   pinMode(ENC1_POS, INPUT);
   pinMode(ENC1_NEG, INPUT);
-  pinMode(ENC2_POS, INPUT);
-  pinMode(ENC2_NEG, INPUT);
+  pinMode(ENC2_POS, INPUT_PULLDOWN); // Avoid noise
+  pinMode(ENC2_NEG, INPUT_PULLDOWN); // Avoid noise
 
   // Attach interrupt for E1+ rising edge
   attachInterrupt(digitalPinToInterrupt(ENC1_POS), encoder1_isr, RISING);
 
-  // Initialize ADC resolution (10-bit default, 0-1023)
+  // Initialize ADC resolution (10-bit, 0-1023)
   analogReadResolution(10);
 
   // Set PWM frequency to 100 Hz
-  Serial.println("PWM frequency set to 100 Hz on pin 4");
-
-  // Debug pin states
-  Serial.println("Motor 1 pins: PWM=" + String(PWM_M1) + ", F2=" + String(DIR_F1) + ", B2=" + String(DIR_B1));
-  Serial.println("Sense pins: M1=A13, M2=A12");
-  Serial.println("Encoder pins: E1+=" + String(ENC1_POS) + ", E1-=" + String(ENC1_NEG));
-  Serial.println("Setup complete");
+  analogWriteFrequency(PWM_M1, 100);
 }
 
 void loop() {
   unsigned long current_time = millis();
 
-  // Every 5 seconds, toggle direction and read measurements
-  if (current_time - last_time >= interval) {
-    // Stop motor briefly before changing direction
-    analogWrite(PWM_M1, 0);
-    digitalWrite(DIR_F1, LOW);
-    digitalWrite(DIR_B1, LOW);
-    delay(100);  // Brief pause to prevent H-bridge stress
-    Serial.println("Motor 1: Stopped briefly");
+  // Calculate sinusoidal PWM: centered at 75% (191), amplitude 25% (64)
+  float t = current_time / 1000.0; // Time in seconds
+  pwm_value = 191 + 64 * sin(2.0 * M_PI * t / (PWM_PERIOD / 1000.0));
+  if (pwm_value < 0) pwm_value = 0;     // Clamp to 0
+  if (pwm_value > 255) pwm_value = 255; // Clamp to 255
 
-    // Toggle Motor 1 direction
-    motor1_forward = !motor1_forward;
+  // Set Motor 1 to forward direction
+  digitalWrite(DIR_F1, HIGH);
+  digitalWrite(DIR_B1, LOW);
+  analogWrite(PWM_M1, pwm_value);  // Apply sinusoidal PWM value
 
-    if (motor1_forward) {
-      digitalWrite(DIR_F1, HIGH);
-      digitalWrite(DIR_B1, LOW);
-      analogWrite(PWM_M1, pwm_value);  // 100% speed
-      Serial.println("Motor 1: Forward, PWM=" + String(pwm_value));
-    } else {
-      digitalWrite(DIR_F1, LOW);
-      digitalWrite(DIR_B1, HIGH);
-      analogWrite(PWM_M1, pwm_value);  // 100% speed
-      Serial.println("Motor 1: Backward, PWM=" + String(pwm_value));
-    }
+  // Reset RPM if no pulses for 1 second (motor stopped or slow)
+  if (micros() - lastA > 1000000) {
+    RPM = 0.0;
+  }
 
+  // Every 100 ms, read and output measurements
+  if (current_time - last_time >= 100) {
     // Read current sense (A13, A12)
     int sense_m1 = analogRead(SENSE_M1);
-    int sense_m2 = analogRead(SENSE_M2);
     float current_m1 = (sense_m1 * 3.3 / 1023.0) / 10.0;  // V_sense / R_sense
-    float current_m2 = (sense_m2 * 3.3 / 1023.0) / 10.0;
 
-    // Read encoder states (A14-A17)
-    int enc1_pos = analogRead(ENC1_POS);  // E1+
-    int enc1_neg = analogRead(ENC1_NEG);  // E1-
-    int enc2_pos = analogRead(ENC2_POS);  // E2+
-    int enc2_neg = analogRead(ENC2_NEG);  // E2-
-
-    // Calculate speed (edges per 5 seconds)
-    float speed_rpm = (enc1_count / 2.0) * (60.0 / 5.0);  // Assume 2 pulses per revolution
-    enc1_count = 0;  // Reset count
-
-    // Determine direction from encoder phase
-    String direction = (enc1_pos > 512 && enc1_neg < 512) ? "Forward" : 
-                      (enc1_neg > 512 && enc1_pos < 512) ? "Backward" : "Unknown";
-
-    // Output measurements
-    Serial.print("Current M1: ");
-    Serial.print(current_m1, 3);
-    Serial.print(" A, Current M2: ");
-    Serial.print(current_m2, 3);
-    Serial.println(" A");
-    Serial.print("Encoder M1: E1+=");
-    Serial.print(enc1_pos);
-    Serial.print(", E1-=");
-    Serial.print(enc1_neg);
-    Serial.print(", Speed: ");
-    Serial.print(speed_rpm, 1);
-    Serial.print(" RPM, Direction: ");
-    Serial.println(direction);
-    Serial.print("Encoder M2: E2+=");
-    Serial.print(enc2_pos);
-    Serial.print(", E2-=");
-    Serial.println(enc2_neg);
+    // Output values in a single line, separated by commas
+    Serial.print(current_m1 * 10, 1); // Current M1 in mA, 1 decimal place
+    Serial.print(",");
+    Serial.print(RPM / 10, 3); // Scaled RPM, 3 decimal places
+    Serial.println(); // New line to complete the data point
 
     last_time = current_time;
   }
